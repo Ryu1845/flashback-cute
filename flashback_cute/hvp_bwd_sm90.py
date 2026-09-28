@@ -6,7 +6,13 @@ Per (n_block, m_block) tile, with c = softmax_scale:
   dS = P (dP - D),  dSdot = Pdot (dP - D) + P (E - Ddot)
   dot_v += Pdot^T dO,  dot_k += dSdot^T Q + dS^T gq,  dot_q (fp32 accum) += dSdot K + dS gk
 dot_k and dot_q are scaled by c in the epilogue / postprocess exactly like FA4's dK / dQ.
-sP holds Pdot, sdS holds dS, sdSdot holds dSdot.
+
+Two MMA layouts (FA4 config knobs):
+  SS dK/dV (SdP_swapAB=False): S-like accumulators are (m, n); sP holds Pdot, sdS holds dS,
+    sdSdot holds dSdot, and every dot_v / dot_k GEMM reads its A operand from smem.
+  RS dK/dV (SdP_swapAB=True, AtomLayoutNdKV=2): S-like accumulators are (n, m), so Pdot^T,
+    dS^T and dSdot^T feed dot_v / dot_k straight from registers; only dS / dSdot go through
+    smem (for dot_q) and there is no sP.
 """
 
 import math
@@ -52,6 +58,10 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         tile_m: int = 64,
         tile_n: int = 64,
         Q_stage: int = 2,
+        dO_stage: Optional[int] = None,
+        PdS_stage: int = 1,
+        SdP_swapAB: bool = False,
+        AtomLayoutNdKV: int = 1,
     ):
         super().__init__(
             dtype,
@@ -64,17 +74,16 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
             tile_m=tile_m,
             tile_n=tile_n,
             Q_stage=Q_stage,
-            dO_stage=Q_stage,
-            PdS_stage=1,
-            SdP_swapAB=False,
+            dO_stage=Q_stage if dO_stage is None else dO_stage,
+            PdS_stage=PdS_stage,
+            SdP_swapAB=SdP_swapAB,
             dKV_swapAB=False,
             dQ_swapAB=False,
             AtomLayoutMSdP=1,
-            AtomLayoutNdKV=1,
+            AtomLayoutNdKV=AtomLayoutNdKV,
             AtomLayoutMdQ=1,
             num_threads=384,
         )
-        assert not self.mma_dkv_is_rs
         assert self.num_wg_dQ == self.num_wg_mma == 2
         self.spt = False
         self.use_block_sparsity = False
@@ -93,6 +102,9 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         sPdS_struct = cute.struct.Align[
             cute.struct.MemRange[self.dtype, cute.cosize(self.sPdS_layout)], 1024
         ]
+        # RS dK/dV feeds Pdot^T from registers: no sP.
+        cosize_sP = cute.cosize(self.sPdS_layout) if const_expr(not self.mma_dkv_is_rs) else 0
+        sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
         sLSE_struct = cute.struct.Align[
             cute.struct.MemRange[Float32, cute.round_up(self.tile_m, 64) * self.Q_stage], 128
         ]
@@ -112,7 +124,7 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
             sV: sV_struct
             sK: sK_struct
             sdO: sdO_struct
-            sP: sPdS_struct
+            sP: sP_struct
             sdS: sPdS_struct
             sdQaccum: sdQaccum_struct
             sZ1: sLSE_struct
@@ -430,7 +442,9 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         sdKdot = storage.sdKdot.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sdVdot = storage.sdVdot.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
+        sP = None
+        if const_expr(not self.mma_dkv_is_rs):
+            sP = storage.sP.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdS = storage.sdS.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         sdSdot = storage.sdSdot.get_tensor(sPdS_layout.outer, swizzle=sPdS_layout.inner)
         stats_layout_Q = cute.make_layout(
@@ -470,7 +484,7 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
             self.tile_n,
             window_size_left=None,
             window_size_right=None,
-            swap_AB=False,
+            swap_AB=self.SdP_swapAB,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
@@ -762,7 +776,7 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         sK: cute.Tensor,
         sV: cute.Tensor,
         sdO: cute.Tensor,
-        sP: cute.Tensor,
+        sP: Optional[cute.Tensor],
         sdS: cute.Tensor,
         sLSE: cute.Tensor,
         sdPsum: cute.Tensor,
@@ -797,28 +811,37 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         wg_mma_dV = tiled_mma_dV.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout(warp_group_idx))
 
+        # Fragments are named by the math operand; with SdP_swapAB the S-like GEMMs run
+        # transposed (S^T = K Q^T etc.) and A_idx / B_idx keep referring to the math operands.
+        swap = self.SdP_swapAB
         # S = Q K^T ; Sdot' = Q gk^T + gq K^T
         shape_mnk_S = (self.tile_m, self.tile_n, self.tile_hdim)
-        _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_S, sQ, sK)
-        _, _, tSrdKdot = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_S, sQ, sdKdot)
-        _, tSrdQdot, _ = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_S, sdQdot, sK)
-        mma_qk_fn = partial(gemm_zero_init, tiled_mma_SdP, shape_mnk_S[:2], tSrQ, tSrK)
-        mma_qdk_fn = partial(gemm_zero_init, tiled_mma_SdP, shape_mnk_S[:2], tSrQ, tSrdKdot)
-        mma_dqk_fn = partial(gemm_w_idx, tiled_mma_SdP, tCrA=tSrdQdot, tCrB=tSrK)
+        partition_SdP = partial(sm90_utils.partition_fragment_ABC, wg_mma_SdP, swap_AB=swap)
+        _, tSrQ, tSrK = partition_SdP(shape_mnk_S, sQ, sK)
+        _, _, tSrdKdot = partition_SdP(shape_mnk_S, sQ, sdKdot)
+        _, tSrdQdot, _ = partition_SdP(shape_mnk_S, sdQdot, sK)
+        mma_qk_fn = partial(gemm_zero_init, tiled_mma_SdP, shape_mnk_S[:2], tSrQ, tSrK, swap_AB=swap)
+        mma_qdk_fn = partial(
+            gemm_zero_init, tiled_mma_SdP, shape_mnk_S[:2], tSrQ, tSrdKdot, swap_AB=swap
+        )
+        mma_dqk_fn = partial(gemm_w_idx, tiled_mma_SdP, tCrA=tSrdQdot, tCrB=tSrK, swap_AB=swap)
         # dP = dO V^T ; E = dO gv^T
         shape_mnk_dP = (self.tile_m, self.tile_n, self.tile_hdimv)
-        _, tdPrdO, tdPrV = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_dP, sdO, sV)
-        _, _, tErdVdot = sm90_utils.partition_fragment_ABC(wg_mma_SdP, shape_mnk_dP, sdO, sdVdot)
-        mma_dov_fn = partial(gemm_zero_init, tiled_mma_SdP, shape_mnk_dP[:2], tdPrdO, tdPrV)
-        mma_dodv_fn = partial(gemm_zero_init, tiled_mma_SdP, shape_mnk_dP[:2], tdPrdO, tErdVdot)
-        # dot_v += Pdot^T dO  (sP holds Pdot)
-        sPt = layout_utils.transpose_view(sP)
+        _, tdPrdO, tdPrV = partition_SdP(shape_mnk_dP, sdO, sV)
+        _, _, tErdVdot = partition_SdP(shape_mnk_dP, sdO, sdVdot)
+        mma_dov_fn = partial(
+            gemm_zero_init, tiled_mma_SdP, shape_mnk_dP[:2], tdPrdO, tdPrV, swap_AB=swap
+        )
+        mma_dodv_fn = partial(
+            gemm_zero_init, tiled_mma_SdP, shape_mnk_dP[:2], tdPrdO, tErdVdot, swap_AB=swap
+        )
+        # dot_v += Pdot^T dO  (A = sP for SS, registers for RS)
+        sPt = layout_utils.transpose_view(sP) if const_expr(sP is not None) else None
         sdOt = layout_utils.transpose_view(sdO)
         shape_mnk_dV = (self.tile_n, self.tile_hdimv, self.tile_m)
         acc_dV, tdVrPt, tdVrdOt = sm90_utils.partition_fragment_ABC(
             wg_mma_dV, shape_mnk_dV, sPt, sdOt
         )
-        mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
         # dot_k += dSdot^T Q + dS^T gq
         sQt = layout_utils.transpose_view(sQ)
         sdQdott = layout_utils.transpose_view(sdQdot)
@@ -831,8 +854,15 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         _, tdKrdSt, tdKrdQdott = sm90_utils.partition_fragment_ABC(
             wg_mma_dK, shape_mnk_dK, sdSt, sdQdott
         )
-        mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSdott, tdKrQt)
-        mma_dsdq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrdQdott)
+        if const_expr(not self.mma_dkv_is_rs):
+            mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt)
+            mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSdott, tdKrQt)
+            mma_dsdq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrdQdott)
+        else:
+            # A operands (Pdot^T, dSdot^T, dS^T) are passed as tCrA per call
+            mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tCrB=tdVrdOt)
+            mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tCrB=tdKrQt)
+            mma_dsdq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tCrB=tdKrdQdott)
         # dot_q = dSdot K + dS gk
         sKt = layout_utils.transpose_view(sK)
         sdKdott = layout_utils.transpose_view(sdKdot)
@@ -846,23 +876,43 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         mma_dsk_fn = partial(gemm_zero_init, tiled_mma_dQ, shape_mnk_dQ[:2], tdQrdSdot, tdQrKt)
         mma_dsdk_fn = partial(gemm_w_idx, tiled_mma_dQ, tCrA=tdQrdS, tCrB=tdQrdKdott)
 
-        # Smem copy atom tiling for Pdot / dS / dSdot R2S
+        # Smem copy atom tiling for Pdot / dS / dSdot R2S ((n, m) accumulators store transposed)
         mms_PdS = self.tile_n // (self.num_wg_mma // self.AtomLayoutMSdP)
         copy_P_r2s, copy_dS_r2s, copy_dSdot_r2s = [
             copy_utils.get_smem_store_C(
                 tiled_mma_SdP,
-                sX,
+                sX if const_expr(not swap) else layout_utils.transpose_view(sX),
                 tidx,
-                transpose=False,
+                transpose=swap,
                 position_independent=True,
                 major_mode_size=mms_PdS,
             )[0]
+            if const_expr(sX is not None)
+            else None
             for sX in (sP, sdS, sdSdot)
         ]
+        # Row statistics. With (n, m) accumulators each thread touches many rows: FA4's shuffle
+        # mode keeps only a slice per quad in registers and fetches rows by warp shuffle.
         tLSEsLSE, tLSEsdPsum, tLSEsZ1, tLSEsDdot = [
-            layout_utils.mma_partition_C_vec(sX, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=True)
+            layout_utils.mma_partition_C_vec(
+                sX, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=not swap
+            )
             for sX in (sLSE, sdPsum, sZ1, sDdot)
         ]
+        if const_expr(self.shuffle_LSE or self.shuffle_dPsum):
+            shfl_thr_copy = copy_utils.tiled_copy_1d(
+                sLSE.element_type, num_threads=8, num_copy_elems=2
+            ).get_slice(cute.arch.lane_idx() // 4)
+            if const_expr(self.shuffle_LSE):
+                tLSEsLSE, tLSEsZ1 = [
+                    cute.group_modes(shfl_thr_copy.partition_S(t), 0, 2)
+                    for t in (tLSEsLSE, tLSEsZ1)
+                ]
+            if const_expr(self.shuffle_dPsum):
+                tLSEsdPsum, tLSEsDdot = [
+                    cute.group_modes(shfl_thr_copy.partition_S(t), 0, 2)
+                    for t in (tLSEsdPsum, tLSEsDdot)
+                ]
 
         smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
@@ -1004,7 +1054,7 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         mma_dsdq_fn: Callable,
         mma_dsk_fn: Callable,
         mma_dsdk_fn: Callable,
-        copy_P_r2s: Callable,
+        copy_P_r2s: Optional[Callable],
         copy_dS_r2s: Callable,
         copy_dSdot_r2s: Callable,
         pipeline_Q: cutlass.pipeline.PipelineAsync,
@@ -1043,31 +1093,35 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         # (3) P = exp2(S * scale_log2 - lse_log2), Pdot = P (c Sdot' - z1)
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
-        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-        acc_Sdot_mn = layout_utils.reshape_acc_to_mn(acc_Sdot)
+        swap = self.SdP_swapAB
+        lane_idx = cute.arch.lane_idx()
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=swap)
+        acc_Sdot_mn = layout_utils.reshape_acc_to_mn(acc_Sdot, transpose=swap)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
-            lse_val = tLSErLSE[r]
-            z1_val = tLSErZ1[r]
+            lse_val = self._get_stat(tLSErLSE, r, lane_idx, shuffle=self.shuffle_LSE)
+            z1_val = self._get_stat(tLSErZ1, r, lane_idx, shuffle=self.shuffle_LSE)
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
                 p = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True)
                 acc_S_mn[r, c] = p
                 acc_Sdot_mn[r, c] = p * (acc_Sdot_mn[r, c] * softmax_scale - z1_val)
 
-        # (4) R2S Pdot (PdS_stage == 1: wait until the previous iteration is done reading sP)
+        # (4) Pdot -> dot_v operand (SS: R2S; PdS_stage == 1: wait until the previous
+        # iteration is done reading sP)
         tdVrPdot = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_Sdot), self.dtype)
-        if const_expr(self.PdS_stage == 1):
-            PdS_barrier.arrive_and_wait()
-        copy_P_r2s(tdVrPdot, dst_idx=smem_idx_PdS)
+        if const_expr(not self.mma_dkv_is_rs):
+            if const_expr(self.PdS_stage == 1):
+                PdS_barrier.arrive_and_wait()
+            copy_P_r2s(tdVrPdot, dst_idx=smem_idx_PdS)
 
         # (5) dS = P (dP - D), dSdot = Pdot (dP - D) + P (E - Ddot)
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
         tLSErDdot = copy_utils.load_s2r(tLSEsDdot[None, smem_idx_dO])
         warpgroup.wait_group(0)
-        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
-        acc_E_mn = layout_utils.reshape_acc_to_mn(acc_E)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=swap)
+        acc_E_mn = layout_utils.reshape_acc_to_mn(acc_E, transpose=swap)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
-            dpsum_val = tLSErdPsum[r]
-            ddot_val = tLSErDdot[r]
+            dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
+            ddot_val = self._get_stat(tLSErDdot, r, lane_idx, shuffle=self.shuffle_dPsum)
             for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
                 dp_minus_d = acc_dP_mn[r, c] - dpsum_val
                 acc_E_mn[r, c] = acc_Sdot_mn[r, c] * dp_minus_d + acc_S_mn[r, c] * (
@@ -1075,16 +1129,27 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
                 )
                 acc_dP_mn[r, c] = acc_S_mn[r, c] * dp_minus_d
 
-        # (6) R2S dS, dSdot (after all threads' Pdot writes are visible)
+        # (6) R2S dS, dSdot. SS: after all threads' Pdot writes are visible (g6 reads both WGs'
+        # halves). RS with a single PdS stage: after both WGs are done reading the previous
+        # dS / dSdot (dot_q GEMMs).
         tdKrdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
         tdKrdSdot = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_E), self.dtype)
-        cute.arch.fence_view_async_shared()
-        PdS_barrier.arrive_and_wait()
+        if const_expr(not self.mma_dkv_is_rs or self.PdS_stage == 1):
+            cute.arch.fence_view_async_shared()
+            PdS_barrier.arrive_and_wait()
         copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
         copy_dSdot_r2s(tdKrdSdot, dst_idx=smem_idx_PdS)
 
-        # (7) dot_v += Pdot^T dO [g6]
-        mma_pdo_fn(A_idx=smem_idx_PdS, B_idx=smem_idx_dO, zero_init=not dKV_accumulate, wg_wait=-1)
+        # (7) dot_v += Pdot^T dO [g6]. RS: issuing it before (5) to overlap the pointwise work
+        # spilled (40 B vs 8 B stack at 240 regs) and was ~10% slower on hdim 64.
+        if const_expr(not self.mma_dkv_is_rs):
+            mma_pdo_fn(
+                A_idx=smem_idx_PdS, B_idx=smem_idx_dO, zero_init=not dKV_accumulate, wg_wait=-1
+            )
+        else:
+            mma_pdo_fn(
+                tCrA=tdVrPdot, B_idx=smem_idx_dO, zero_init=not dKV_accumulate, wg_wait=-1
+            )
         # smem fence to make sure sdS / sdSdot are written before they're read by WGMMA
         cute.arch.fence_view_async_shared()
         PdS_barrier.arrive_and_wait()
@@ -1095,8 +1160,16 @@ class FlashbackHvpBwdSm90(FlashAttentionBackwardSm90):
         pipeline_dO.consumer_release(consumer_state_dO_cur)  # dO only read by g4-g6
 
         # (9) dot_k += dSdot^T Q [g9] + dS^T gq [g10]; returns with g7-g8 complete
-        mma_dsq_fn(A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=-1)
-        mma_dsdq_fn(A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=False, wg_wait=2)
+        if const_expr(not self.mma_dkv_is_rs):
+            mma_dsq_fn(
+                A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=-1
+            )
+            mma_dsdq_fn(A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=False, wg_wait=2)
+        else:
+            mma_dsq_fn(
+                tCrA=tdKrdSdot, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=-1
+            )
+            mma_dsdq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=False, wg_wait=2)
 
         # (10) dot_q R2S: wait for dQaccum_store to free the smem buffer, then write to smem
         cute.arch.barrier(

@@ -4,10 +4,11 @@ Forward and first-order backward are stock FA4 kernels. The double backward (gra
 (dq, dk, dv) w.r.t. (q, k, v, dout)) runs two CuTe-DSL kernels derived from FA4's SM90
 forward / backward:
 
-  K1 FlashbackJvpFwdSm90  (Q-block outer): dot_dout = (P*Sdot) V + P gv - z1*O,  z1 = rowsum(P*Sdot)
+  K1 FlashbackJvpFwdSm90  (Q-block outer): dot_dout = (P*Sdot) V + P gv - z1*O,  z1 = rowsum(P*Sdot),
+                          Ddot = rowsum(dO*dot_dout)
   K2 FlashbackHvpBwdSm90  (KV-block outer): dot_q, dot_k, dot_v
 
-with Sdot = c (Q gk^T + gq K^T), Pdot = P (Sdot - z1), D = rowsum(dO*O), Ddot = rowsum(dO*dot_dout),
+with Sdot = c (Q gk^T + gq K^T), Pdot = P (Sdot - z1), D = rowsum(dO*O),
 dS = P (dO V^T - D), dSdot = Pdot (dO V^T - D) + P (dO gv^T - Ddot),
 dot_v = Pdot^T dO, dot_k = c (dSdot^T Q + dS^T gq), dot_q = c (dSdot K + dS gk).
 """
@@ -33,9 +34,24 @@ from flashback_cute.hvp_bwd_sm90 import FlashbackHvpBwdSm90
 K1_TILE_M = 128
 K1_TILE_N = 64
 K1_NUM_STAGES = 2
+# K2 tile_m is shared with K1 (tile_m_bwd), preprocess and postprocess: it is the row padding
+# granularity of the fp32 stats / dot_q accumulator buffers.
 K2_TILE_M = 64
-K2_TILE_N = 64
-K2_Q_STAGE = {64: 2, 128: 2}
+# Per head_dim K2 (FlashbackHvpBwdSm90) MMA configs. Register budget (240/thread) is what
+# decides: 4 S-like fp32 accumulators + dot_k/dot_v accumulators + dot_q accumulator.
+K2_CONFIGS = {
+    # 64x128 tile, S-like GEMMs transposed so Pdot^T / dS^T / dSdot^T feed dot_v / dot_k
+    # from registers (FA4's hdim-128 layout); 8 of 10 GEMMs run at full WGMMA width.
+    64: dict(tile_n=128, Q_stage=2, PdS_stage=2, SdP_swapAB=True, AtomLayoutNdKV=2),
+    # 64x128 would need 288 accumulator regs/thread (dot_k + dot_v alone take 128), so the
+    # tile stays 64x64. Two PdS stages drop the cross-WG barrier before the Pdot store
+    # (0.7-2% faster non-causal, 3-5% causal); their 24 KB of smem is paid for by a single dO
+    # stage (the pair lands just under the 227 KB limit). Measured slower on this config: also
+    # dropping the barrier before the dS store (g6 then waits for the post-store barrier;
+    # ~2% slower causal), Q / dO as register A operands of the S-like GEMMs (1-7%), and
+    # red.global dot_q accumulation instead of smem + TMA reduce (7-9%).
+    128: dict(tile_n=64, Q_stage=2, dO_stage=1, PdS_stage=2, SdP_swapAB=False, AtomLayoutNdKV=1),
+}
 
 # Plain in-process caches: FA4's disk cache fingerprints only flash_attn/cute sources, so edits
 # to our kernels would load stale binaries.
@@ -74,8 +90,11 @@ def _compile_and_run(cache, kernel_name, make_obj, key_extra, tensor_args, softm
     cache[key](*tensor_args, softmax_scale, cu_seqlens_q, cu_seqlens_k)
 
 
-def _jvp_fwd(q, k, v, gdq, gdk, gdv, out, lse_log2, dot_dout, z1, softmax_scale, causal, cu_seqlens_q, cu_seqlens_k):
-    """K1: dot_dout (input dtype) and z1 (fp32, padded like lse_log2)."""
+def _jvp_fwd(
+    q, k, v, gdq, gdk, gdv, out, dout, lse_log2, dot_dout, z1, ddot,
+    softmax_scale, causal, cu_seqlens_q, cu_seqlens_k,
+):
+    """K1: dot_dout (input dtype); z1 and ddot (fp32, padded like lse_log2)."""
     cute_dtype = torch2cute_dtype_map[q.dtype]
     head_dim = q.shape[-1]
     qhead_per_kvhead = q.shape[-2] // k.shape[-2]
@@ -93,7 +112,7 @@ def _jvp_fwd(q, k, v, gdq, gdk, gdv, out, lse_log2, dot_dout, z1, softmax_scale,
             num_stages=K1_NUM_STAGES,
         ),
         (cute_dtype, head_dim, qhead_per_kvhead, causal),
-        (q, k, v, gdq, gdk, gdv, out, lse_log2, dot_dout, z1),
+        (q, k, v, gdq, gdk, gdv, out, dout, lse_log2, dot_dout, z1, ddot),
         softmax_scale,
         cu_seqlens_q,
         cu_seqlens_k,
@@ -117,8 +136,7 @@ def _hvp_bwd(
             qhead_per_kvhead,
             causal,
             tile_m=K2_TILE_M,
-            tile_n=K2_TILE_N,
-            Q_stage=K2_Q_STAGE[head_dim],
+            **K2_CONFIGS[head_dim],
         ),
         (cute_dtype, head_dim, qhead_per_kvhead, causal),
         (q, k, v, dout, gdq, gdk, gdv, lse_log2, dpsum, z1, ddot, dotq_accum, dot_k, dot_v),
@@ -157,9 +175,9 @@ def _double_backward(
         dotq_accum = torch.empty(num_head, total_q_rounded_padded * head_dim, **f32)
     dpsum = torch.empty(stats_shape, **f32)
     lse_log2 = torch.empty(stats_shape, **f32)
-    ddot = torch.empty(stats_shape, **f32)
-    # K2 reads z1 on padding / gap rows (multiplied by P = 0): must not hold NaN garbage.
-    z1 = torch.zeros(stats_shape, **f32)
+    # K2 reads z1 / ddot on padding / gap rows (multiplied by P = 0) that K1 never writes: they
+    # must not hold NaN garbage. One allocation keeps it a single memset.
+    z1, ddot = torch.zeros((2, *stats_shape), **f32).unbind(0)
 
     dot_dout = torch.empty_like(dout)
     dot_q = torch.empty_like(q)
@@ -167,13 +185,14 @@ def _double_backward(
     dot_v = torch.empty_like(v)
     is_gqa = num_head > num_head_kv
     if is_gqa:
+        k2_tile_n = K2_CONFIGS[head_dim]["tile_n"]
         if cu_seqlens_k is None:
             batch_size, seqlen_k = k.shape[:2]
-            seqlen_k_rounded = _round_up(seqlen_k, K2_TILE_N)
+            seqlen_k_rounded = _round_up(seqlen_k, k2_tile_n)
             accum_shape = (batch_size, num_head_kv, seqlen_k_rounded * head_dim)
         else:
             total_k = k.shape[0]
-            total_k_rounded_padded = (total_k + cu_seqlens_k.shape[0] * K2_TILE_N - 1) // K2_TILE_N * K2_TILE_N
+            total_k_rounded_padded = (total_k + cu_seqlens_k.shape[0] * k2_tile_n - 1) // k2_tile_n * k2_tile_n
             accum_shape = (num_head_kv, total_k_rounded_padded * head_dim)
         dotk_accum = torch.zeros(accum_shape, **f32)
         dotv_accum = torch.zeros(accum_shape, **f32)
@@ -186,14 +205,9 @@ def _double_backward(
         fake_mode=False,
         hdim_multiple_of=32,
     )
-    _jvp_fwd(q, k, v, gdq, gdk, gdv, out, lse_log2, dot_dout, z1, softmax_scale, causal, cu_seqlens_q, cu_seqlens_k)
-    # Ddot = rowsum(dO * dot_dout).
-    _bwd_preprocess(
-        dot_dout, dout, ddot, lse, None, None,
-        cu_seqlens_q, None, None,
-        cute_dtype, head_dim, head_dim, K2_TILE_M,
-        fake_mode=False,
-        hdim_multiple_of=32,
+    _jvp_fwd(
+        q, k, v, gdq, gdk, gdv, out, dout, lse_log2, dot_dout, z1, ddot,
+        softmax_scale, causal, cu_seqlens_q, cu_seqlens_k,
     )
     _hvp_bwd(
         q, k, v, dout, gdq, gdk, gdv, lse_log2, dpsum, z1, ddot, dotq_accum,
@@ -212,24 +226,17 @@ def _double_backward(
         hdim_multiple_of=32,
     )
     if is_gqa:
-        _bwd_postprocess_convert(
-            dotk_accum, dot_k, softmax_scale,
-            cu_seqlens_k, None,
-            90, cute_dtype, head_dim, K2_TILE_N, num_threads_post,
-            1, False,
-            cluster_size=1,
-            fake_mode=False,
-            hdim_multiple_of=32,
-        )
-        _bwd_postprocess_convert(
-            dotv_accum, dot_v, 1.0,
-            cu_seqlens_k, None,
-            90, cute_dtype, head_dim, K2_TILE_N, num_threads_post,
-            1, False,
-            cluster_size=1,
-            fake_mode=False,
-            hdim_multiple_of=32,
-        )
+        # Layout of the fp32 dK/dV accumulators written by K2's GQA epilogue.
+        dkv_layout = (k2_tile_n, num_threads_post, K2_CONFIGS[head_dim]["AtomLayoutNdKV"], False)
+        for accum, dst, scale in ((dotk_accum, dot_k, softmax_scale), (dotv_accum, dot_v, 1.0)):
+            _bwd_postprocess_convert(
+                accum, dst, scale,
+                cu_seqlens_k, None,
+                90, cute_dtype, head_dim, *dkv_layout,
+                cluster_size=1,
+                fake_mode=False,
+                hdim_multiple_of=32,
+            )
     return dot_q, dot_k, dot_v, dot_dout
 
 

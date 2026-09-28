@@ -3,8 +3,9 @@
 Q-block outer loop over KV blocks with the forward LSE known (no online softmax). Per KV block:
   S = Q K^T,  Sdot' = Q gk^T + gq K^T,  P = exp2(S * scale_log2 - lse_log2),  W = c * P * Sdot'
   z1 += rowsum(W),  acc += W V + P gv
-Epilogue: dot_dout = acc - z1 * O (written in the input dtype), z1 written to the fp32 padded
-stats layout (tile_m_bwd padding, as the backward preprocess / K2 expect).
+Epilogue: dot_dout = acc - z1 * O (written in the input dtype); z1 and Ddot = rowsum(dO * dot_dout)
+(from the fp32 dot_dout, before rounding) written to the fp32 padded stats layout (tile_m_bwd
+padding, as the backward preprocess / K2 expect).
 """
 
 import math
@@ -44,6 +45,8 @@ from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 
 
 class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
+    """Writes dot_dout (input dtype) plus z1 and Ddot (fp32, padded stats layout) for K2."""
+
     def __init__(
         self,
         dtype,
@@ -71,7 +74,7 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
             intra_wg_overlap=False,
             mma_pv_is_rs=True,
         )
-        # Padding granularity of the fp32 stats buffers (lse_log2, z1) shared with the backward.
+        # Padding granularity of the fp32 stats buffers (lse_log2, z1, Ddot) shared with the backward.
         self.tile_m_bwd = tile_m_bwd
 
     def _get_shared_storage_cls(self):
@@ -109,9 +112,11 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
         mdKdot: cute.Tensor,  # cotangent of dK, like mK
         mdVdot: cute.Tensor,  # cotangent of dV, like mV
         mO: cute.Tensor,  # forward output, like mQ
+        mdO: cute.Tensor,  # forward output cotangent, like mQ
         mLSElog2: cute.Tensor,  # (b, h, s_q_rounded) or (h, total_q_padded), fp32
         mdOdot: cute.Tensor,  # output, like mQ
         mZ1: cute.Tensor,  # output, like mLSElog2
+        mDdot: cute.Tensor,  # output, like mLSElog2
         softmax_scale: Float32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
@@ -125,24 +130,26 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
             )
         )
         assert mdQdot.element_type == mdKdot.element_type == mdVdot.element_type == self.dtype
-        assert mO.element_type == self.dtype
-        assert mLSElog2.element_type == Float32
+        assert mO.element_type == mdO.element_type == self.dtype
+        assert mLSElog2.element_type == mDdot.element_type == Float32
 
         self.varlen_q = mCuSeqlensQ is not None
 
-        mQ, mK, mV, mdQdot, mdKdot, mdVdot, mO, mdOdot = [
-            assume_tensor_aligned(t) for t in (mQ, mK, mV, mdQdot, mdKdot, mdVdot, mO, mdOdot)
+        mQ, mK, mV, mdQdot, mdKdot, mdVdot, mO, mdO, mdOdot = [
+            assume_tensor_aligned(t) for t in (mQ, mK, mV, mdQdot, mdKdot, mdVdot, mO, mdO, mdOdot)
         ]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mdQdot, mO, mdOdot = [
-            layout_utils.select(t, QO_layout_transpose) for t in (mQ, mdQdot, mO, mdOdot)
+        mQ, mdQdot, mO, mdO, mdOdot = [
+            layout_utils.select(t, QO_layout_transpose) for t in (mQ, mdQdot, mO, mdO, mdOdot)
         ]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV, mdKdot, mdVdot = [
             layout_utils.select(t, KV_layout_transpose) for t in (mK, mV, mdKdot, mdVdot)
         ]
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-        mLSElog2, mZ1 = [layout_utils.select(t, LSE_layout_transpose) for t in (mLSElog2, mZ1)]
+        mLSElog2, mZ1, mDdot = [
+            layout_utils.select(t, LSE_layout_transpose) for t in (mLSElog2, mZ1, mDdot)
+        ]
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
@@ -265,9 +272,11 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
             tma_tensor_dKdot,
             tma_tensor_dVdot,
             mO,
+            mdO,
             mLSElog2,
             tma_tensor_O,
             mZ1,
+            mDdot,
             mCuSeqlensQ,
             mCuSeqlensK,
             tma_atom_Q,
@@ -305,9 +314,11 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
         mdKdot: cute.Tensor,
         mdVdot: cute.Tensor,
         mO: cute.Tensor,
+        mdO: cute.Tensor,
         mLSElog2: cute.Tensor,
         mdOdot: cute.Tensor,
         mZ1: cute.Tensor,
+        mDdot: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
@@ -454,9 +465,11 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
                 tiled_mma_qk,
                 tiled_mma_pv,
                 mO,
+                mdO,
                 mLSElog2,
                 mdOdot,
                 mZ1,
+                mDdot,
                 sQ,
                 sK,
                 sVt,
@@ -602,9 +615,11 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         mO: cute.Tensor,
+        mdO: cute.Tensor,
         mLSElog2: cute.Tensor,
         mdOdot: cute.Tensor,
         mZ1: cute.Tensor,
+        mDdot: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sVt: cute.Tensor,
@@ -757,8 +772,10 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
                 acc_O,
                 z1,
                 mO,
+                mdO,
                 mdOdot,
                 mZ1,
+                mDdot,
                 sO,
                 seqlen,
                 tma_atom_O,
@@ -830,8 +847,10 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
         acc_O: cute.Tensor,
         z1: cute.Tensor,
         mO: cute.Tensor,
+        mdO: cute.Tensor,
         mdOdot: cute.Tensor,
         mZ1: cute.Tensor,
+        mDdot: cute.Tensor,
         sO: cute.Tensor,
         seqlen: SeqlenInfoQK,
         tma_atom_O: cute.CopyAtom,
@@ -849,16 +868,27 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
         tOcO = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(cO))
         row_limit = seqlen.seqlen_q - m_block * self.tile_m
 
-        # dot_dout = acc_O - z1 * O  (rows of acc_S and acc_O coincide per thread)
+        # dot_dout = acc_O - z1 * O  (rows of acc_S and acc_O coincide per thread), and this
+        # thread's partial of Ddot = rowsum(dO * dot_dout) from the fp32 dot_dout.
         mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
         gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
         tOgO = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(gO))
+        mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx]
+        gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+        tOgdO = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(gdO))
         acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
         assert cute.size(acc_O_mn, mode=[0]) == cute.size(z1)
+        ddot = cute.make_rmem_tensor(cute.size(z1), Float32)
+        ddot.fill(0.0)
         for r in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
             if tOcO[r, 0][0] < row_limit:
                 o_row = tOgO[r, None].load().to(Float32)
-                acc_O_mn[r, None].store(acc_O_mn[r, None].load() - z1[r] * o_row)
+                dot_do_row = acc_O_mn[r, None].load() - z1[r] * o_row
+                acc_O_mn[r, None].store(dot_do_row)
+                do_row = tOgdO[r, None].load().to(Float32)
+                ddot[r] = utils.fadd_reduce(dot_do_row * do_row, init_val=ddot[r], arch=90)
+        # quad reduction for Ddot (same row distribution as z1)
+        ddot.store(utils.warp_reduce(ddot.load(), operator.add, width=4))
 
         rO = cute.make_fragment_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
@@ -874,18 +904,22 @@ class FlashbackJvpFwdSm90(FlashAttentionForwardSm90):
         taccOsO = smem_thr_copy_O.partition_D(sO)
         cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
 
-        # Write z1 (natural units, padded stats layout); only the column-0 thread of each quad.
+        # Write z1 (natural units) and Ddot to the padded stats layout; only the column-0 thread
+        # of each quad.
         mZ1_cur = seqlen.offset_batch_Q(mZ1, batch_idx, dim=2, padded=True)[None, head_idx]
+        mDdot_cur = seqlen.offset_batch_Q(mDdot, batch_idx, dim=2, padded=True)[None, head_idx]
+        stat_expand = cute.make_layout((self.tile_hdimv,), stride=(0,))
         gZ1 = cute.local_tile(mZ1_cur, (self.tile_m,), (m_block,))
-        gZ1_expanded = cute.make_tensor(
-            gZ1.iterator,
-            cute.append(gZ1.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))),
-        )
+        gDdot = cute.local_tile(mDdot_cur, (self.tile_m,), (m_block,))
+        gZ1_expanded = cute.make_tensor(gZ1.iterator, cute.append(gZ1.layout, stat_expand))
+        gDdot_expanded = cute.make_tensor(gDdot.iterator, cute.append(gDdot.layout, stat_expand))
         taccOgZ1 = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(gZ1_expanded))
+        taccOgDdot = layout_utils.reshape_acc_to_mn(thr_mma_pv.partition_C(gDdot_expanded))
         if tOcO[0][1] == 0:
             for r in cutlass.range(cute.size(taccOgZ1, mode=[0]), unroll_full=True):
                 if tOcO[r, 0][0] < row_limit:
                     taccOgZ1[r, 0] = z1[r]
+                    taccOgDdot[r, 0] = ddot[r]
 
         ragged = seqlen.has_cu_seqlens_q
         mdOdot_cur = seqlen.offset_batch_Q(mdOdot, batch_idx, dim=3, ragged=ragged)[
