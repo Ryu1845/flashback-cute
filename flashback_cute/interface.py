@@ -39,18 +39,47 @@ K1_NUM_STAGES = 2
 K2_TILE_M = 64
 # Per head_dim K2 (FlashbackHvpBwdSm90) MMA configs. Register budget (240/thread) is what
 # decides: 4 S-like fp32 accumulators + dot_k/dot_v accumulators + dot_q accumulator.
+# Measured slower on both configs: issuing block i's dot_q GEMMs in block i+1 so they run under
+# its pointwise work (hdim 64: 1-5%, spills at 240 regs when dot_q stays live over the dS
+# pointwise; hdim 128: 3-34%, worst where the single dO stage is released latest).
+# hdim 64: smem row stats cut K2 time by 3.6% / 2.8% (4096 non-causal / causal);
+# exp2 polynomial every fourth value was flat (+0.1% causal), every second was 4-5%
+# slower and exceeded the 1e-3 error bound. hdim 128: splitting S-like GEMMs
+# by warpgroup cut K2 time by 5.4% / 3.6% (4096 non-causal / causal).
+# mask_split skips apply_mask outside the causal diagonal and the last, partial n_block:
+# "loops" is FA3's separate mask-free copy of the block, "branch" one copy with apply_mask
+# behind a warp-uniform branch.
 K2_CONFIGS = {
     # 64x128 tile, S-like GEMMs transposed so Pdot^T / dS^T / dSdot^T feed dot_v / dot_k
     # from registers (FA4's hdim-128 layout); 8 of 10 GEMMs run at full WGMMA width.
-    64: dict(tile_n=128, Q_stage=2, PdS_stage=2, SdP_swapAB=True, AtomLayoutNdKV=2),
+    # Each warpgroup accumulates its own full-width dot_q partial over its 64 key rows, so the
+    # warpgroups share only the Q / dO pipeline and take turns on the tensor cores (block i's
+    # dot_v / dot_q / dot_k plus block i+1's S-like GEMMs per turn), putting one warpgroup's
+    # pointwise work under the other's GEMMs. With the branch mask this cut K2 time by
+    # 4.5% / 7.2% at 4096 (non-causal / causal), 4.0-5.3% at 2048 and 4.6-8.2% at 8192. The
+    # partials alone were ~2% slower (twice the dot_q reduce-add traffic), ping-pong without
+    # mask_split gained 0.9% / 1.9%, and the "loops" split instead of "branch" 2.9% / 1.2%.
+    # Measured flat or slower: alternating the S-like and dot batches as separate turns, and
+    # handing the turn over right after S / Sdot are issued.
+    64: dict(
+        tile_n=128, Q_stage=2, PdS_stage=2, SdP_swapAB=True, AtomLayoutNdKV=2,
+        mask_split="branch",
+    ),
     # 64x128 would need 288 accumulator regs/thread (dot_k + dot_v alone take 128), so the
     # tile stays 64x64. Two PdS stages drop the cross-WG barrier before the Pdot store
     # (0.7-2% faster non-causal, 3-5% causal); their 24 KB of smem is paid for by a single dO
     # stage (the pair lands just under the 227 KB limit). Measured slower on this config: also
     # dropping the barrier before the dS store (g6 then waits for the post-store barrier;
     # ~2% slower causal), Q / dO as register A operands of the S-like GEMMs (1-7%), and
-    # red.global dot_q accumulation instead of smem + TMA reduce (7-9%).
-    128: dict(tile_n=64, Q_stage=2, dO_stage=1, PdS_stage=2, SdP_swapAB=False, AtomLayoutNdKV=1),
+    # red.global dot_q accumulation instead of smem + TMA reduce (7-9%). A 128x64 tile would
+    # give the S-like GEMMs full WGMMA width but needs ~275 KB smem even single-staged
+    # (single-stage Q / dO alone: 50% slower).
+    # mask_split="loops" cut K2 time by 2.5% / 2.4% at 4096 and 1.6-2.9% at 2048 / 8192;
+    # "branch" gained only 0.4-0.7% non-causal.
+    128: dict(
+        tile_n=64, Q_stage=2, dO_stage=1, PdS_stage=2, SdP_swapAB=False, AtomLayoutNdKV=1,
+        mask_split="loops",
+    ),
 }
 
 # Plain in-process caches: FA4's disk cache fingerprints only flash_attn/cute sources, so edits
@@ -216,10 +245,13 @@ def _double_backward(
         softmax_scale, causal, cu_seqlens_q, cu_seqlens_k,
     )
     num_threads_post = 256  # 2 MMA warpgroups
+    # K2's RS path (SdP_swapAB) adds per-warpgroup dot_q partials, each laid out as one
+    # warpgroup's (tile_m, hdim) MMA tile.
+    num_threads_post_dQ = 128 if K2_CONFIGS[head_dim]["SdP_swapAB"] else 256
     _bwd_postprocess_convert(
         dotq_accum, dot_q, softmax_scale,
         cu_seqlens_q, None,
-        90, cute_dtype, head_dim, K2_TILE_M, num_threads_post,
+        90, cute_dtype, head_dim, K2_TILE_M, num_threads_post_dQ,
         1, False,
         use_2cta_instrs=False, cluster_size=1,
         fake_mode=False,
